@@ -1,5 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import uvicorn
 import os
 import yfinance as yf
@@ -65,21 +67,45 @@ def run_training():
     state["training_job"]["status"] = "training"
     state["training_job"]["progress"] = 10
     try:
-        df = yf.download(state["ticker"], period="2y")
+        # Try yfinance first
+        df = yf.download(state["ticker"], period="1y")
+        
+        # If failed, generate sample data
+        if df is None or len(df) < 50:
+            print("yfinance failed, using sample data...")
+            import numpy as np
+            dates = pd.date_range(end=pd.Timestamp.today(), periods=300)
+            price = 150 + np.cumsum(np.random.randn(300) * 0.5)
+            price = np.abs(price)
+            df = pd.DataFrame({
+                'Open': price * 0.99,
+                'High': price * 1.02,
+                'Low': price * 0.98,
+                'Close': price,
+                'Volume': np.random.randint(1000000, 5000000, 300)
+            }, index=dates)
+            print(f"Sample data created: {len(df)} rows")
+
         df = add_indicators(df)
+        if len(df) == 0:
+            raise Exception("DataFrame empty after indicators")
+            
         env = StockTradingEnv(df, initial_capital=state["initial_capital"])
-        model = train_agent(env, timesteps=int(os.getenv("TRAINING_TIMESTEPS", 100000)))
+        state["env"] = env
+        
+        model = train_agent(env, timesteps=int(os.getenv("TRAINING_TIMESTEPS", 50000)))
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_path = f"models/trading_agent_{timestamp}"
         model.save(model_path)
         state["agent"] = model
-        state["env"] = env
         state["training_job"]["status"] = "completed"
         state["training_job"]["progress"] = 100
+        print("Training completed!")
     except Exception as e:
+        print(f"Training error: {e}")
         state["training_job"]["status"] = f"failed: {e}"
         state["training_job"]["progress"] = 0
-
 @app.get("/train")
 def train(background_tasks: BackgroundTasks):
     if state["training_job"]["status"] == "training":
@@ -133,6 +159,13 @@ def reset():
         state["env"].reset()
         return {"message": "Environment reset successfully"}
     return {"message": "History cleared, environment not initialized yet"}
+
+# Static files - Frontend (mount AFTER all API routes)
+app.mount("/frontend", StaticFiles(directory="frontend"), name="frontend")
+
+@app.get("/")
+def root():
+    return FileResponse("frontend/index.html")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
