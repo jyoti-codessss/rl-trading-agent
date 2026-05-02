@@ -1,29 +1,27 @@
-import pandas_ta as ta
+import ta
 import pandas as pd
 
 def add_indicators(df):
-    """
-    Calculates technical indicators using pandas-ta.
-    """
-    # RSI (14 period)
-    df['rsi'] = ta.rsi(df['Close'], length=14)
+    # Flatten multi-level columns if present
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     
-    # MACD (12, 26, 9)
-    macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
-    df['macd'] = macd['MACD_12_26_9']
-    df['macd_signal'] = macd['MACDs_12_26_9']
-    df['macd_hist'] = macd['MACDh_12_26_9']
+    df = df.copy()
     
-    # Bollinger Bands (20 period)
-    bbands = ta.bbands(df['Close'], length=20, std=2)
-    df['bb_upper'] = bbands['BBU_20_2.0']
-    df['bb_lower'] = bbands['BBL_20_2.0']
-    df['bb_mid'] = bbands['BBM_20_2.0']
+    # RSI
+    df['rsi'] = ta.momentum.RSIIndicator(close=df['Close'], window=14).rsi()
     
-    # Volume moving average
-    df['volume_sma'] = ta.sma(df['Volume'], length=20)
+    # MACD
+    macd = ta.trend.MACD(close=df['Close'])
+    df['macd'] = macd.macd()
     
-    # Fill NaN values
-    df.fillna(0, inplace=True)
+    # Bollinger Bands
+    bb = ta.volatility.BollingerBands(close=df['Close'], window=20)
+    df['bb_upper'] = bb.bollinger_hband()
+    df['bb_lower'] = bb.bollinger_lband()
     
+    # Volume MA
+    df['volume_ma'] = df['Volume'].rolling(window=20).mean()
+    
+    df.dropna(inplace=True)
     return df

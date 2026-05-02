@@ -22,7 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global state
 state = {
     "agent": None,
     "env": None,
@@ -34,7 +33,6 @@ state = {
 
 @app.on_event("startup")
 async def startup_event():
-    # Attempt to load the latest model
     model_dir = "models"
     if os.path.exists(model_dir):
         models = [f for f in os.listdir(model_dir) if f.endswith(".zip")]
@@ -42,43 +40,50 @@ async def startup_event():
             latest_model = sorted(models)[-1]
             state["agent"] = load_agent(os.path.join(model_dir, latest_model))
             print(f"Loaded model: {latest_model}")
-            
-    # Initialize environment with some data
-    df = yf.download(state["ticker"], period="2y")
-    df = add_indicators(df)
-    state["env"] = StockTradingEnv(df, initial_capital=state["initial_capital"])
+    try:
+        df = yf.download(state["ticker"], period="2y")
+        if df is not None and len(df) > 50:
+            df = add_indicators(df)
+            if len(df) > 0:
+                state["env"] = StockTradingEnv(df, initial_capital=state["initial_capital"])
+                print("Environment initialized successfully!")
+        else:
+            print("Warning: Could not download stock data, server starting without env")
+    except Exception as e:
+        print(f"Warning: Startup error: {e}, continuing anyway...")
 
 @app.get("/health")
 def health():
     return {
         "status": "healthy",
         "model": "loaded" if state["agent"] else "not loaded",
-        "ticker": state["ticker"]
+        "ticker": state["ticker"],
+        "env_ready": state["env"] is not None
     }
 
 def run_training():
     state["training_job"]["status"] = "training"
-    state["training_job"]["progress"] = 10 # Simulate progress
-    
-    df = yf.download(state["ticker"], period="2y")
-    df = add_indicators(df)
-    env = StockTradingEnv(df, initial_capital=state["initial_capital"])
-    
-    model = train_agent(env, timesteps=int(os.getenv("TRAINING_TIMESTEPS", 100000)))
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = f"models/trading_agent_{timestamp}"
-    model.save(model_path)
-    
-    state["agent"] = model
-    state["training_job"]["status"] = "completed"
-    state["training_job"]["progress"] = 100
+    state["training_job"]["progress"] = 10
+    try:
+        df = yf.download(state["ticker"], period="2y")
+        df = add_indicators(df)
+        env = StockTradingEnv(df, initial_capital=state["initial_capital"])
+        model = train_agent(env, timesteps=int(os.getenv("TRAINING_TIMESTEPS", 100000)))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_path = f"models/trading_agent_{timestamp}"
+        model.save(model_path)
+        state["agent"] = model
+        state["env"] = env
+        state["training_job"]["status"] = "completed"
+        state["training_job"]["progress"] = 100
+    except Exception as e:
+        state["training_job"]["status"] = f"failed: {e}"
+        state["training_job"]["progress"] = 0
 
 @app.get("/train")
 def train(background_tasks: BackgroundTasks):
     if state["training_job"]["status"] == "training":
         return {"message": "Training already in progress"}
-    
     background_tasks.add_task(run_training)
     return {"message": "Training started", "job_id": "ppo_train_001"}
 
@@ -89,28 +94,27 @@ def status():
 @app.get("/predict")
 def predict():
     if not state["agent"]:
-        return {"error": "Model not loaded"}
-    
-    obs, _ = state["env"].reset() # Simplified for prediction
+        return {"error": "Model not loaded. Please train first."}
+    if not state["env"]:
+        return {"error": "Environment not ready. Stock data unavailable."}
+    obs, _ = state["env"].reset()
     action = predict_action(state["agent"], obs)
-    
-    current_price = state["env"].df.iloc[state["env"].current_step]['Close']
-    
+    current_price = float(state["env"].df.iloc[state["env"].current_step]['Close'])
     action_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
     prediction = {
         "action": action_map[int(action)],
-        "confidence": 0.95, # PPO doesn't give direct confidence easily without more code
-        "current_price": float(current_price),
+        "confidence": 0.95,
+        "current_price": current_price,
         "timestamp": datetime.now().isoformat()
     }
-    
-    # Add to history
     state["history"].append(prediction)
     return prediction
 
 @app.get("/portfolio")
 def portfolio():
     env = state["env"]
+    if env is None:
+        return {"value": 10000, "return": 0.0, "shares": 0, "cash": 10000, "note": "Environment not ready"}
     return {
         "value": float(env.portfolio_value),
         "return": float((env.portfolio_value - env.initial_capital) / env.initial_capital * 100),
@@ -124,9 +128,11 @@ def history():
 
 @app.post("/reset")
 def reset():
-    state["env"].reset()
     state["history"] = []
-    return {"message": "Environment reset"}
+    if state["env"] is not None:
+        state["env"].reset()
+        return {"message": "Environment reset successfully"}
+    return {"message": "History cleared, environment not initialized yet"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
